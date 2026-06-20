@@ -11,3 +11,8 @@ CONFIG_PACKAGE_kmod-usb-serial-ftdi=y
 CONFIG_PACKAGE_kmod-usb-serial-pl2303=y
 CONFIG_PACKAGE_kmod-usb-storage=y
 CONFIG_PACKAGE_usb-modeswitch=y
+# MediaTek MT7610U USB Wi-Fi (Panda AC600 / generic 0e8d:7610) for EUD 2.4/5GHz APs.
+# Pulls kmod-mt76x0-common (ships mt7610e.bin firmware) + kmod-mt76x02-usb.
+CONFIG_PACKAGE_kmod-mt76x0-common=y
+CONFIG_PACKAGE_kmod-mt76x02-usb=y
+CONFIG_PACKAGE_kmod-mt76x0u=y
