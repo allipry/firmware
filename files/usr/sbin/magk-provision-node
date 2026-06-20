@@ -30,8 +30,8 @@ ENV_FILE="${1:-/etc/magk-node.env}"
 # --- required / defaulted params --------------------------------------------
 : "${NODE_NAME:?set NODE_NAME in env}"
 : "${NODE_ROLE:?set NODE_ROLE=gateway|meshpoint}"
-: "${NODE_MGMT_IP:?set NODE_MGMT_IP (unique per node)}"
 : "${MESH_KEY:?set MESH_KEY}"
+NODE_MGMT_IP="${NODE_MGMT_IP:-}"   # gateway only; mesh-point IPs are owned by openmanetd
 : "${EUD_5G_KEY:?set EUD_5G_KEY}"
 : "${NET_24_KEY:?set NET_24_KEY}"
 MGMT_NETMASK="${MGMT_NETMASK:-255.255.0.0}"
@@ -42,7 +42,7 @@ NET_24_SSID="${NET_24_SSID:-MAGK-NET}"; NET_24_CHANNEL="${NET_24_CHANNEL:-6}"
 WAN_IFACE="${WAN_IFACE:-eth0}"
 case "$NODE_ROLE" in gateway|meshpoint) ;; *) echo "ERROR: NODE_ROLE must be gateway|meshpoint" >&2; exit 1;; esac
 
-echo "==> provisioning $NODE_NAME as $NODE_ROLE (mgmt $NODE_MGMT_IP, mesh $MESH_ID ch$MESH_CHANNEL)"
+echo "==> provisioning $NODE_NAME as $NODE_ROLE (mesh $MESH_ID ch$MESH_CHANNEL)"
 
 # --- ensure radios are enumerated + a wireless config exists -----------------
 # (At first boot the USB/SPI phys + /etc/config/wireless may not be ready yet.)
@@ -176,13 +176,8 @@ uci set network.batmesh0=interface
 uci set network.batmesh0.proto='batadv_hardif'
 uci set network.batmesh0.master='bat0'
 
-# br-ahwlan bridge carrying bat0 (APs are bridged in via network='ahwlan')
-uci set network.ahwlan=interface
-uci set network.ahwlan.proto='static'
-uci set network.ahwlan.device='br-ahwlan'
-uci set network.ahwlan.ipaddr="$NODE_MGMT_IP"
-uci set network.ahwlan.netmask="$MGMT_NETMASK"
-# ensure the bridge device exists with bat0 as a member
+# br-ahwlan bridge (the EUD/mesh L2; APs bridge in via network='ahwlan').
+# Find-or-create the bridge device section.
 brsec=""
 for s in $(uci show network | sed -n "s/^network\.\(@device\[[0-9]*\]\)\.name='br-ahwlan'/\1/p"); do brsec="$s"; done
 if [ -z "$brsec" ]; then
@@ -190,18 +185,24 @@ if [ -z "$brsec" ]; then
   uci set network.$brsec.name='br-ahwlan'
 fi
 uci set network.$brsec.type='bridge'
-uci set network.$brsec.ports='bat0'
 
 if [ "$NODE_ROLE" = "gateway" ]; then
-  # uplink: WAN_IFACE as DHCP client to upstream; bridge carries bat0 only
+  # Gateway: fixed static mgmt IP (DHCP server + NAT need a stable subnet anchor).
+  uci set network.ahwlan=interface
+  uci set network.ahwlan.proto='static'
+  uci set network.ahwlan.device='br-ahwlan'
+  uci set network.ahwlan.ipaddr="${NODE_MGMT_IP:-10.41.0.1}"
+  uci set network.ahwlan.netmask="$MGMT_NETMASK"
+  uci set network.$brsec.ports='bat0'
+  # uplink: WAN_IFACE as DHCP client to upstream
   uci set network.wan=interface
   uci set network.wan.device="$WAN_IFACE"
   uci set network.wan.proto='dhcp'
-  uci set network.$brsec.ports='bat0'
 else
-  # meshpoint: WAN_IFACE becomes a wired LAN port bridged into the mesh L2.
-  # No separate IP on eth0 (avoids conflicting with the ahwlan mgmt IP); a wired
-  # EUD/laptop on eth0 joins the mesh and gets DHCP from the gateway.
+  # Mesh point: openmanetd OWNS the mgmt IP (a unique MAC-derived 10.41.x.x) and
+  # rewrites it on every boot, so we DO NOT set network.ahwlan.ipaddr here —
+  # forcing one is futile. WAN_IFACE becomes a wired LAN port bridged into the
+  # mesh L2 (a wired EUD/laptop on it joins the mesh + gets DHCP from the gateway).
   uci -q delete network.wan || true
   uci -q delete network.lan || true
   uci set network.$brsec.ports="bat0 $WAN_IFACE"
@@ -270,8 +271,11 @@ fi
 
 echo "==> done. summary:"
 echo "  hostname : $(uci -q get system.@system[0].hostname)"
-echo "  role     : $NODE_ROLE (bat0.gw_mode=$(uci -q get network.bat0.gw_mode))"
-echo "  mgmt ip  : $(uci -q get network.ahwlan.ipaddr)"
+if [ "$NODE_ROLE" = "gateway" ]; then
+  echo "  role     : gateway (bat0.gw_mode=$(uci -q get network.bat0.gw_mode)), mgmt ip $(uci -q get network.ahwlan.ipaddr)"
+else
+  echo "  role     : meshpoint (bat0.gw_mode=$(uci -q get network.bat0.gw_mode)); mgmt IP assigned by openmanetd (find via 'batctl meshif bat0 dat_cache' on the gateway, or hostname $NODE_NAME)"
+fi
 echo "  mesh     : id=$MESH_ID ch$MESH_CHANNEL  | morse=$MORSE"
 echo "  5G EUD   : ${EUD_5G_SSID:-skip} on ${ONBOARD:-none}"
 echo "  2.4G NET : ${NET_24_SSID:-skip} on ${DONGLE:-none}"
