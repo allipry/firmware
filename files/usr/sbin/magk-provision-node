@@ -1,0 +1,280 @@
+#!/bin/sh
+# =============================================================================
+# magk-provision-node.sh — non-interactive MAGK node provisioning from a .env.
+#
+# The ekhwizards setup wizard is browser-only (ucode/JS, no CLI), so this script
+# reproduces the UCI config it writes — parameterised from a .env file — for the
+# MAGK single-dongle topology:
+#   - HaLow 802.11s mesh over morse  (radio auto-detected by type=morse / SPI)
+#   - 5 GHz EUD AP on the onboard CYW43455  (mmc path)  -> operator phone/tablet
+#   - 2.4 GHz AP on ONE USB dongle          (usb path)  -> other players' EUDs
+#   - batman-adv bat0 bridged into br-ahwlan (L2 mesh)
+# Roles: gateway  (gw_mode=server, DHCP server, NAT uplink on $WAN_IFACE)
+#        meshpoint(gw_mode=client, no DHCP server — the gateway serves the L2)
+#
+# Radios are matched by type/bus PATH (not radioN names), so this works on a
+# freshly flashed node regardless of USB enumeration order.
+#
+# Run ON the node (BusyBox ash / POSIX sh):
+#   scp magk-provision-node.sh node.env root@<node>:/tmp/
+#   ssh root@<node> 'sh /tmp/magk-provision-node.sh /tmp/node.env'
+# Idempotent: safe to re-run. Backs up /etc/config/{wireless,network,dhcp,firewall}.
+# =============================================================================
+set -eu
+
+ENV_FILE="${1:-/etc/magk-node.env}"
+[ -f "$ENV_FILE" ] || { echo "ERROR: env file not found: $ENV_FILE" >&2; exit 1; }
+# shellcheck disable=SC1090
+. "$ENV_FILE"
+
+# --- required / defaulted params --------------------------------------------
+: "${NODE_NAME:?set NODE_NAME in env}"
+: "${NODE_ROLE:?set NODE_ROLE=gateway|meshpoint}"
+: "${NODE_MGMT_IP:?set NODE_MGMT_IP (unique per node)}"
+: "${MESH_KEY:?set MESH_KEY}"
+: "${EUD_5G_KEY:?set EUD_5G_KEY}"
+: "${NET_24_KEY:?set NET_24_KEY}"
+MGMT_NETMASK="${MGMT_NETMASK:-255.255.0.0}"
+MESH_ID="${MESH_ID:-MAGK-NET}"
+MESH_CHANNEL="${MESH_CHANNEL:-24}"
+EUD_5G_SSID="${EUD_5G_SSID:-MAGK-EUD}"; EUD_5G_CHANNEL="${EUD_5G_CHANNEL:-36}"
+NET_24_SSID="${NET_24_SSID:-MAGK-NET}"; NET_24_CHANNEL="${NET_24_CHANNEL:-6}"
+WAN_IFACE="${WAN_IFACE:-eth0}"
+case "$NODE_ROLE" in gateway|meshpoint) ;; *) echo "ERROR: NODE_ROLE must be gateway|meshpoint" >&2; exit 1;; esac
+
+echo "==> provisioning $NODE_NAME as $NODE_ROLE (mgmt $NODE_MGMT_IP, mesh $MESH_ID ch$MESH_CHANNEL)"
+
+# --- ensure radios are enumerated + a wireless config exists -----------------
+# (At first boot the USB/SPI phys + /etc/config/wireless may not be ready yet.)
+i=0; while [ "$i" -lt 25 ]; do [ -e /sys/class/ieee80211/phy0 ] && break; i=$((i+1)); sleep 1; done
+[ -s /etc/config/wireless ] || wifi config 2>/dev/null || true
+
+# --- backups ----------------------------------------------------------------
+TS="$(date +%s)"
+for f in wireless network dhcp firewall; do
+  [ -f "/etc/config/$f" ] && cp "/etc/config/$f" "/etc/config/$f.bak.provision.$TS"
+done
+
+# --- classify radios by type / bus path -------------------------------------
+MORSE=""; ONBOARD=""; DONGLE=""; EXTRAS=""
+for dev in $(uci show wireless | sed -n 's/^wireless\.\([^.]*\)=wifi-device/\1/p'); do
+  t="$(uci -q get wireless.$dev.type || true)"
+  p="$(uci -q get wireless.$dev.path || true)"
+  if [ "$t" = "morse" ]; then MORSE="$dev"
+  elif echo "$p" | grep -q "mmc"; then ONBOARD="$dev"
+  elif echo "$p" | grep -q "usb"; then
+    if [ -z "$DONGLE" ]; then DONGLE="$dev"; else EXTRAS="$EXTRAS $dev"; fi
+  else EXTRAS="$EXTRAS $dev"; fi
+done
+echo "    radios: morse=$MORSE onboard=$ONBOARD dongle=$DONGLE extras=[$EXTRAS]"
+[ -n "$MORSE" ] || { echo "ERROR: no morse (HaLow) radio found — wrong image/board?" >&2; exit 1; }
+
+# --- band assignment by onboard 5GHz capability -----------------------------
+# EUD AP = 5 GHz (operator's phone/tablet); NET AP = 2.4 GHz (other players).
+# Which radio hosts which band depends on what the onboard Wi-Fi can do:
+#   * Pi4 CYW43455 (dual-band): onboard -> 5GHz EUD, USB dongle -> 2.4GHz NET
+#   * Pi Zero (2.4GHz-only onboard): onboard -> 2.4GHz NET, USB dongle -> 5GHz EUD
+phy_supports_5g() {  # $1 = sysfs bus substring (e.g. mmc); echoes yes|no
+  for phy in $(ls /sys/class/ieee80211 2>/dev/null); do
+    rp="$(readlink -f "/sys/class/ieee80211/$phy/device" 2>/dev/null)"
+    case "$rp" in *"$1"*)
+      if iw phy "$phy" info 2>/dev/null | grep -qE '\* 5[0-9]{3}(\.[0-9]+)? MHz'; then echo yes; else echo no; fi
+      return ;; esac
+  done
+  echo no
+}
+ONBOARD_5G=no
+[ -n "$ONBOARD" ] && ONBOARD_5G="$(phy_supports_5g mmc)"
+if [ "$ONBOARD_5G" = yes ]; then
+  EUD5G_DEV="$ONBOARD"; NET24_DEV="$DONGLE"
+else
+  NET24_DEV="$ONBOARD"; EUD5G_DEV="$DONGLE"
+fi
+echo "    onboard 5GHz capable: $ONBOARD_5G  ->  EUD(5G)=${EUD5G_DEV:-none}  NET(2.4G)=${NET24_DEV:-none}"
+[ -n "$EUD5G_DEV" ] || echo "WARN: no radio available for the 5GHz EUD AP — skipping it" >&2
+[ -n "$NET24_DEV" ] || echo "WARN: no radio available for the 2.4GHz NET AP — skipping it" >&2
+
+# --- hostname ---------------------------------------------------------------
+uci set system.@system[0].hostname="$NODE_NAME"
+[ -f /proc/sys/kernel/hostname ] && echo "$NODE_NAME" > /proc/sys/kernel/hostname || true
+
+# =============================================================================
+# WIRELESS — wipe wifi-iface sections, recreate deterministically
+# =============================================================================
+for s in $(uci show wireless | sed -n "s/^wireless\.\([^.]*\)=wifi-iface/\1/p"); do
+  uci -q delete "wireless.$s" || true
+done
+
+# HaLow mesh on the morse radio
+uci set wireless.$MORSE.disabled='0'
+uci set wireless.$MORSE.channel="$MESH_CHANNEL"
+[ -n "${MESH_HTMODE:-}" ] && uci set wireless.$MORSE.htmode="$MESH_HTMODE" || true
+mesh="wifinet_mesh"
+uci -q delete "wireless.$mesh" || true
+uci set wireless.$mesh=wifi-iface
+uci set wireless.$mesh.device="$MORSE"
+uci set wireless.$mesh.mode='mesh'
+uci set wireless.$mesh.mesh_id="$MESH_ID"
+uci set wireless.$mesh.network='batmesh0'
+uci set wireless.$mesh.encryption='sae'
+uci set wireless.$mesh.key="$MESH_KEY"
+uci set wireless.$mesh.mesh_fwding='0'   # batman-adv does the forwarding, not 802.11s
+uci set wireless.$mesh.beacon_int='1000'
+
+# 5 GHz EUD AP (operator) — on whichever radio can do 5 GHz
+if [ -n "$EUD5G_DEV" ]; then
+  uci set wireless.$EUD5G_DEV.disabled='0'
+  uci set wireless.$EUD5G_DEV.band='5g'
+  uci set wireless.$EUD5G_DEV.channel="$EUD_5G_CHANNEL"
+  uci -q delete "wireless.wifinet_eud5g" || true
+  uci set wireless.wifinet_eud5g=wifi-iface
+  uci set wireless.wifinet_eud5g.device="$EUD5G_DEV"
+  uci set wireless.wifinet_eud5g.mode='ap'
+  uci set wireless.wifinet_eud5g.ssid="$EUD_5G_SSID"
+  uci set wireless.wifinet_eud5g.network='ahwlan'
+  uci set wireless.wifinet_eud5g.encryption='psk2'
+  uci set wireless.wifinet_eud5g.key="$EUD_5G_KEY"
+fi
+
+# 2.4 GHz NET AP (other players) — on the remaining radio
+if [ -n "$NET24_DEV" ]; then
+  uci set wireless.$NET24_DEV.disabled='0'
+  uci set wireless.$NET24_DEV.band='2g'
+  uci set wireless.$NET24_DEV.channel="$NET_24_CHANNEL"
+  uci -q delete "wireless.wifinet_net24" || true
+  uci set wireless.wifinet_net24=wifi-iface
+  uci set wireless.wifinet_net24.device="$NET24_DEV"
+  uci set wireless.wifinet_net24.mode='ap'
+  uci set wireless.wifinet_net24.ssid="$NET_24_SSID"
+  uci set wireless.wifinet_net24.network='ahwlan'
+  uci set wireless.wifinet_net24.encryption='psk2'
+  uci set wireless.wifinet_net24.key="$NET_24_KEY"
+fi
+
+# disable any extra/unused radios (e.g. a second dongle, phantom mac80211-on-SPI)
+for d in $EXTRAS; do uci set wireless.$d.disabled='1'; done
+
+# =============================================================================
+# NETWORK — batman-adv bat0 bridged into br-ahwlan
+# =============================================================================
+# bat0 batman device + role
+uci set network.bat0=interface
+uci set network.bat0.proto='batadv'
+uci set network.bat0.routing_algo='BATMAN_V'
+uci set network.bat0.bridge_loop_avoidance='1'
+uci set network.bat0.distributed_arp_table='1'
+uci set network.bat0.multicast_mode='0'
+uci set network.bat0.orig_interval='1000'
+if [ "$NODE_ROLE" = "gateway" ]; then
+  uci set network.bat0.gw_mode='server'
+else
+  uci set network.bat0.gw_mode='client'
+fi
+
+# morse mesh hardif -> bat0
+uci set network.batmesh0=interface
+uci set network.batmesh0.proto='batadv_hardif'
+uci set network.batmesh0.master='bat0'
+
+# br-ahwlan bridge carrying bat0 (APs are bridged in via network='ahwlan')
+uci set network.ahwlan=interface
+uci set network.ahwlan.proto='static'
+uci set network.ahwlan.device='br-ahwlan'
+uci set network.ahwlan.ipaddr="$NODE_MGMT_IP"
+uci set network.ahwlan.netmask="$MGMT_NETMASK"
+# ensure the bridge device exists with bat0 as a member
+brsec=""
+for s in $(uci show network | sed -n "s/^network\.\(@device\[[0-9]*\]\)\.name='br-ahwlan'/\1/p"); do brsec="$s"; done
+if [ -z "$brsec" ]; then
+  brsec="$(uci add network device)"
+  uci set network.$brsec.name='br-ahwlan'
+fi
+uci set network.$brsec.type='bridge'
+uci set network.$brsec.ports='bat0'
+
+if [ "$NODE_ROLE" = "gateway" ]; then
+  # uplink: WAN_IFACE as DHCP client to upstream; bridge carries bat0 only
+  uci set network.wan=interface
+  uci set network.wan.device="$WAN_IFACE"
+  uci set network.wan.proto='dhcp'
+  uci set network.$brsec.ports='bat0'
+else
+  # meshpoint: WAN_IFACE becomes a wired LAN port bridged into the mesh L2.
+  # No separate IP on eth0 (avoids conflicting with the ahwlan mgmt IP); a wired
+  # EUD/laptop on eth0 joins the mesh and gets DHCP from the gateway.
+  uci -q delete network.wan || true
+  uci -q delete network.lan || true
+  uci set network.$brsec.ports="bat0 $WAN_IFACE"
+fi
+
+# =============================================================================
+# DHCP — gateway serves the shared L2; meshpoint must NOT run a DHCP server
+# =============================================================================
+if [ "$NODE_ROLE" = "gateway" ]; then
+  uci set dhcp.ahwlan=dhcp
+  uci set dhcp.ahwlan.interface='ahwlan'
+  uci set dhcp.ahwlan.start='100'
+  uci set dhcp.ahwlan.limit='150'
+  uci set dhcp.ahwlan.leasetime='12h'
+  uci set dhcp.ahwlan.force='1'
+  uci -q delete dhcp.ahwlan.ignore || true
+else
+  uci set dhcp.ahwlan=dhcp
+  uci set dhcp.ahwlan.interface='ahwlan'
+  uci set dhcp.ahwlan.ignore='1'
+fi
+
+# =============================================================================
+# FIREWALL — gateway NATs ahwlan->WAN; meshpoint just accepts the ahwlan zone
+# =============================================================================
+# ahwlan zone (find-or-create by name)
+ahz=""
+for z in $(uci show firewall | sed -n "s/^firewall\.\([^.]*\)\.name='ahwlan'/\1/p"); do ahz="$z"; done
+[ -n "$ahz" ] || { ahz="$(uci add firewall zone)"; uci set firewall.$ahz.name='ahwlan'; }
+uci set firewall.$ahz.network='ahwlan'
+uci set firewall.$ahz.input='ACCEPT'
+uci set firewall.$ahz.output='ACCEPT'
+uci set firewall.$ahz.forward='ACCEPT'
+
+if [ "$NODE_ROLE" = "gateway" ]; then
+  wz=""
+  for z in $(uci show firewall | sed -n "s/^firewall\.\([^.]*\)\.name='wan'/\1/p"); do wz="$z"; done
+  [ -n "$wz" ] || { wz="$(uci add firewall zone)"; uci set firewall.$wz.name='wan'; }
+  uci set firewall.$wz.network='wan'
+  uci set firewall.$wz.input='REJECT'
+  uci set firewall.$wz.output='ACCEPT'
+  uci set firewall.$wz.forward='REJECT'
+  uci set firewall.$wz.masq='1'
+  # allow ahwlan -> wan forwarding
+  fwd=""
+  for f in $(uci show firewall | sed -n "s/^firewall\.\([^.]*\)\.name='ahwlan-wan'/\1/p"); do fwd="$f"; done
+  [ -n "$fwd" ] || { fwd="$(uci add firewall forwarding)"; uci set firewall.$fwd.name='ahwlan-wan'; }
+  uci set firewall.$fwd.src='ahwlan'
+  uci set firewall.$fwd.dest='wan'
+fi
+
+# =============================================================================
+# COMMIT + APPLY
+# =============================================================================
+uci commit
+if [ "${MAGK_NO_RELOAD:-0}" = "1" ]; then
+  echo "==> committed (MAGK_NO_RELOAD=1: skipping reload; config applies on next boot/service start)"
+else
+  echo "==> committed; reloading network + wifi"
+  /etc/init.d/network reload 2>/dev/null || /etc/init.d/network restart
+  /etc/init.d/dnsmasq reload 2>/dev/null || true
+  /etc/init.d/firewall reload 2>/dev/null || true
+  wifi reload 2>/dev/null || wifi
+  sleep 8
+fi
+
+echo "==> done. summary:"
+echo "  hostname : $(uci -q get system.@system[0].hostname)"
+echo "  role     : $NODE_ROLE (bat0.gw_mode=$(uci -q get network.bat0.gw_mode))"
+echo "  mgmt ip  : $(uci -q get network.ahwlan.ipaddr)"
+echo "  mesh     : id=$MESH_ID ch$MESH_CHANNEL  | morse=$MORSE"
+echo "  5G EUD   : ${EUD_5G_SSID:-skip} on ${ONBOARD:-none}"
+echo "  2.4G NET : ${NET_24_SSID:-skip} on ${DONGLE:-none}"
+command -v morse_cli >/dev/null && { printf "  halow    : "; morse_cli -i wlan0 channel 2>/dev/null | tr '\n' ' '; echo; }
+echo "  live APs : $(iw dev 2>/dev/null | grep -c 'type AP')"
+echo "Run validate-gw1.sh / batctl meshif bat0 n to confirm mesh peering."

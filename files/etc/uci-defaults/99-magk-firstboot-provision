@@ -1,0 +1,35 @@
+#!/bin/sh
+# =============================================================================
+# 99-magk-firstboot-provision — first-boot auto-provisioning (optional)
+# =============================================================================
+# If a node env file is present, provision this node non-interactively at first
+# boot (no ekhwizards web wizard, no manual radio disabling). Otherwise do
+# nothing — the node boots to image defaults and you can provision later with:
+#     magk-provision-node /etc/magk-node.env
+#
+# To auto-provision: before first boot, drop your filled-in node.env onto the
+# SD card's FAT boot partition as  magk-node.env  (editable on any computer).
+# Per-node values that MUST differ: NODE_NAME / NODE_ROLE / NODE_MGMT_IP.
+#
+# Runs MAGK_NO_RELOAD=1 so it only writes UCI; the normal boot sequence brings
+# the radios/network up with the new config. uci-defaults exit 0 => runs once.
+# =============================================================================
+
+SRC=""
+for c in /boot/magk-node.env /boot/magk/node.env /mnt/boot/magk-node.env; do
+    [ -f "$c" ] && { SRC="$c"; break; }
+done
+
+# No dropped env -> leave a template at /etc and skip (manual provisioning later)
+if [ -z "$SRC" ]; then
+    [ -f /etc/magk-node.env ] || cp /etc/magk-node.env.example /etc/magk-node.env 2>/dev/null
+    exit 0
+fi
+
+cp "$SRC" /etc/magk-node.env
+MAGK_NO_RELOAD=1 /bin/sh /usr/sbin/magk-provision-node /etc/magk-node.env || {
+    logger -t magk-firstboot "provisioning failed from $SRC (will retry next boot)"
+    exit 1
+}
+logger -t magk-firstboot "provisioned from $SRC"
+exit 0
