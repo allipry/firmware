@@ -40,6 +40,7 @@ MESH_CHANNEL="${MESH_CHANNEL:-24}"
 EUD_5G_SSID="${EUD_5G_SSID:-MAGK-EUD}"; EUD_5G_CHANNEL="${EUD_5G_CHANNEL:-36}"
 NET_24_SSID="${NET_24_SSID:-MAGK-NET}"; NET_24_CHANNEL="${NET_24_CHANNEL:-6}"
 WAN_IFACE="${WAN_IFACE:-eth0}"
+FAST_ROAM="${FAST_ROAM:-1}"        # 1 = enable 802.11r/k/v fast roaming on the APs
 case "$NODE_ROLE" in gateway|meshpoint) ;; *) echo "ERROR: NODE_ROLE must be gateway|meshpoint" >&2; exit 1;; esac
 
 echo "==> provisioning $NODE_NAME as $NODE_ROLE (mesh $MESH_ID ch$MESH_CHANNEL)"
@@ -98,6 +99,22 @@ echo "    onboard 5GHz capable: $ONBOARD_5G  ->  EUD(5G)=${EUD5G_DEV:-none}  NET
 uci set system.@system[0].hostname="$NODE_NAME"
 [ -f /proc/sys/kernel/hostname ] && echo "$NODE_NAME" > /proc/sys/kernel/hostname || true
 
+# Apply 802.11r/k/v fast roaming to an AP section so non-MANET clients hand off
+# cleanly between nodes (same ESS bridged over the batman mesh).
+#   $1 = wifi-iface section   $2 = mobility_domain (4 hex, stable per SSID)
+set_roaming() {
+  uci set wireless.$1.ieee80211r='1'            # 802.11r Fast BSS Transition
+  uci set wireless.$1.mobility_domain="$2"
+  uci set wireless.$1.ft_psk_generate_local='1' # derive FT keys locally from PSK (no r0kh/r1kh lists)
+  uci set wireless.$1.ft_over_ds='0'            # over-the-air FT (most compatible)
+  uci set wireless.$1.reassociation_deadline='1000'
+  uci set wireless.$1.ieee80211k='1'            # 802.11k neighbor/beacon reports
+  uci set wireless.$1.rrm_neighbor_report='1'
+  uci set wireless.$1.rrm_beacon_report='1'
+  uci set wireless.$1.bss_transition='1'        # 802.11v BSS Transition Management
+  uci set wireless.$1.wnm_sleep_mode='1'
+}
+
 # =============================================================================
 # WIRELESS — wipe wifi-iface sections, recreate deterministically
 # =============================================================================
@@ -134,6 +151,7 @@ if [ -n "$EUD5G_DEV" ]; then
   uci set wireless.wifinet_eud5g.network='ahwlan'
   uci set wireless.wifinet_eud5g.encryption='psk2'
   uci set wireless.wifinet_eud5g.key="$EUD_5G_KEY"
+  [ "$FAST_ROAM" = 1 ] && set_roaming wifinet_eud5g 'ed05'
 fi
 
 # 2.4 GHz NET AP (other players) — on the remaining radio
@@ -149,6 +167,7 @@ if [ -n "$NET24_DEV" ]; then
   uci set wireless.wifinet_net24.network='ahwlan'
   uci set wireless.wifinet_net24.encryption='psk2'
   uci set wireless.wifinet_net24.key="$NET_24_KEY"
+  [ "$FAST_ROAM" = 1 ] && set_roaming wifinet_net24 'be24'
 fi
 
 # disable any extra/unused radios (e.g. a second dongle, phantom mac80211-on-SPI)
