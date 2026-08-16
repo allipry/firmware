@@ -104,7 +104,7 @@ endef
 define KernelPackage/mt76x0u
   $(KernelPackage/mt76-default)
   TITLE:=MediaTek MT76x0U wireless driver
-  DEPENDS+=+kmod-mt76x0-common +kmod-mt76x02-usb
+  DEPENDS+=+kmod-mt76x0-common +kmod-mt76x02-usb +mt7610u-firmware
   FILES:=\
 	$(PKG_BUILD_DIR)/mt76x0/mt76x0u.ko
   AUTOLOAD:=$(call AutoProbe,mt76x0u)
@@ -538,8 +538,13 @@ define KernelPackage/mt76x2-common/install
 endef
 
 define KernelPackage/mt76x0u/install
-	$(INSTALL_DIR) $(1)/lib/firmware/mediatek
-	ln -sf mt7610e.bin $(1)/lib/firmware/mediatek/mt7610u.bin
+	# Firmware intentionally NOT installed here. Upstream created
+	# /lib/firmware/mediatek/mt7610u.bin as a symlink to mt7610e.bin (the PCIe
+	# blob), which is the wrong firmware for a USB part. The real 80288-byte
+	# mt7610u.bin is installed by the mt7610u-firmware package, which this
+	# package now depends on. Re-adding a symlink here would also collide with
+	# that package's file.
+	true
 endef
 
 define KernelPackage/mt76x2u/install

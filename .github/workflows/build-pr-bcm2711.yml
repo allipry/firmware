@@ -8,8 +8,10 @@ on:
     paths:
     - 'boards/ekh-bcm2711/**'
     - 'boards/common/**'
+    - 'boards/common_extras/**'
     - 'include/kernel*'
     - 'package/kernel/**'
+    - 'package/firmware/**'
     - 'target/linux/bcm27xx/**'
     - 'feeds.conf.default'
 
