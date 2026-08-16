@@ -12,7 +12,12 @@ CONFIG_PACKAGE_kmod-usb-serial-pl2303=y
 CONFIG_PACKAGE_kmod-usb-storage=y
 CONFIG_PACKAGE_usb-modeswitch=y
 # MediaTek MT7610U USB Wi-Fi (Panda AC600 / generic 0e8d:7610) for EUD 2.4/5GHz APs.
-# Pulls kmod-mt76x0-common (ships mt7610e.bin firmware) + kmod-mt76x02-usb.
+# Driver: kmod-mt76x0u (+ mt76x0-common, mt76x02-usb).
+# Firmware: the USB part needs mediatek/mt7610u.bin (80288 bytes). The mt76 source
+# ships ONLY mt7610e.bin (PCIe, 80680 bytes), so mt7610u-firmware supplies the real
+# blob from linux-firmware. kmod-mt76x0u depends on it, but it is listed explicitly
+# here so the requirement is visible in the board config.
 CONFIG_PACKAGE_kmod-mt76x0-common=y
 CONFIG_PACKAGE_kmod-mt76x02-usb=y
 CONFIG_PACKAGE_kmod-mt76x0u=y
+CONFIG_PACKAGE_mt7610u-firmware=y

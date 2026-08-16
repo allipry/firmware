@@ -7,6 +7,20 @@ define Package/mt7601u-firmware/install
 endef
 $(eval $(call BuildPackage,mt7601u-firmware))
 
+# MT7610U (USB) needs its OWN firmware blob. The mt76 package source ships only
+# mt7610e.bin (PCIe, 80680 bytes) and upstream symlinks mt7610u.bin -> mt7610e.bin,
+# which feeds a USB part the PCIe firmware. The real mt7610u.bin is a distinct
+# 80288-byte blob that ships in this linux-firmware tarball, so install it properly.
+# kmod-mt76x0u depends on this package (see package/kernel/mt76/Makefile).
+Package/mt7610u-firmware = $(call Package/firmware-default,MediaTek MT7610U firmware,,LICENCE.mediatek)
+define Package/mt7610u-firmware/install
+	$(INSTALL_DIR) $(1)/lib/firmware/mediatek
+	$(INSTALL_DATA) \
+		$(PKG_BUILD_DIR)/mediatek/mt7610u.bin \
+		$(1)/lib/firmware/mediatek
+endef
+$(eval $(call BuildPackage,mt7610u-firmware))
+
 Package/rt2800-pci-firmware = $(call Package/firmware-default,Ralink RT28xx/3xxx PCI/SoC firmware)
 define Package/rt2800-pci-firmware/install
 	$(INSTALL_DIR) $(1)/lib/firmware
