@@ -41,6 +41,7 @@ EUD_5G_SSID="${EUD_5G_SSID:-MAGK-EUD}"; EUD_5G_CHANNEL="${EUD_5G_CHANNEL:-36}"
 NET_24_SSID="${NET_24_SSID:-MAGK-NET}"; NET_24_CHANNEL="${NET_24_CHANNEL:-6}"
 WAN_IFACE="${WAN_IFACE:-eth0}"
 FAST_ROAM="${FAST_ROAM:-1}"        # 1 = enable 802.11r/k/v fast roaming on the APs
+COUNTRY="${COUNTRY:-US}"           # regulatory domain, applied to EVERY radio below
 case "$NODE_ROLE" in gateway|meshpoint) ;; *) echo "ERROR: NODE_ROLE must be gateway|meshpoint" >&2; exit 1;; esac
 
 echo "==> provisioning $NODE_NAME as $NODE_ROLE (mesh $MESH_ID ch$MESH_CHANNEL)"
@@ -68,6 +69,17 @@ for dev in $(uci show wireless | sed -n 's/^wireless\.\([^.]*\)=wifi-device/\1/p
   else EXTRAS="$EXTRAS $dev"; fi
 done
 echo "    radios: morse=$MORSE onboard=$ONBOARD dongle=$DONGLE extras=[$EXTRAS]"
+
+# --- regulatory domain (MUST be set on EVERY radio) -------------------------
+# Previously COUNTRY was accepted in the env and then never applied, which left
+# `iw reg get` at the world domain "00" and the 5 GHz radio with no country at
+# all. Set it on every wifi-device we know about, including extras, so no radio
+# can come up without a regdomain.
+for dev in $MORSE $ONBOARD $DONGLE $EXTRAS; do
+  [ -n "$dev" ] || continue
+  uci set wireless.$dev.country="$COUNTRY"
+done
+echo "    regulatory domain: $COUNTRY (applied to all radios)"
 [ -n "$MORSE" ] || { echo "ERROR: no morse (HaLow) radio found — wrong image/board?" >&2; exit 1; }
 
 # --- band assignment by onboard 5GHz capability -----------------------------
