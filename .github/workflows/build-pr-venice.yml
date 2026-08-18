@@ -7,8 +7,10 @@ on:
   pull_request:
     paths:
     - 'boards/venice/**'
+    - 'boards/common_extras/**'
     - 'include/kernel*'
     - 'package/kernel/**'
+    - 'package/firmware/**'
     - 'target/linux/imx/**'
     - 'feeds.conf.default'
 

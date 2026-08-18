@@ -7,8 +7,10 @@ on:
   pull_request:
     paths:
     - 'boards/ht-hd01-v2/**'
+    - 'boards/common_extras/**'
     - 'include/kernel*'
     - 'package/kernel/**'
+    - 'package/firmware/**'
     - 'target/linux/ramips/**'
     - 'feeds.conf.default'
 
