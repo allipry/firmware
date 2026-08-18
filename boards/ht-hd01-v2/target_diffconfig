@@ -87,3 +87,29 @@ CONFIG_PACKAGE_kmod-ptp=y
 
 # MAGK mesh node configuration marker
 # This board is used as a MAGK OpenMANET mesh node (HaLow backhaul)
+
+# openmanetd (PTT voice) cannot function on this board, so do not ship it.
+# boards/common/openmanet_diffconfig enables it fleet-wide; this overrides that for
+# HT-HD01 only, and the board config is concatenated after common so it wins.
+#
+# Evidence, from mt7628an_heltec_ht-hd01-v2.dts:
+#   - no sound/codec node. The only audio-ish references are the MT7628 SoC's own
+#     I2S pinctrl group and pin names (I2S_SDI/SDO/WS/CLK); nothing is wired or
+#     enabled, so there is no local audio path.
+#   - no usb/ehci/ohci node at all, and this board does not symlink usb_diffconfig,
+#     so a USB sound device is not an option either.
+# With no audio in and no audio out, PTT has nothing to drive: the daemon would run
+# and never be usable.
+#
+# NOTE this is NOT a flash-space change. The firmware partition is 0x1fb0000
+# (31.7 MiB, IMAGE_SIZE 32448k) and a built image is ~11.5 MiB, so roughly 65% is
+# free -- there is no flash pressure on this board. The saving is real but small and
+# is not the reason for doing this.
+#
+# Mesh routing (batman-adv, alfred) is unaffected. Only PTT voice is excluded.
+# Disabling openmanetd alone is deliberate: its audio/HID dependencies
+# (portaudio, libopus, alsa-lib, kmod-usb-audio, kmod-sound-core, hidapi, libevdev)
+# are not selected anywhere for this board, so dependency resolution drops them.
+# Setting each to =n explicitly would risk fighting another package that legitimately
+# needs one of them.
+CONFIG_PACKAGE_openmanetd=n
