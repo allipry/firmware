@@ -147,8 +147,22 @@ uci set wireless.$mesh.mesh_id="$MESH_ID"
 uci set wireless.$mesh.network='batmesh0'
 uci set wireless.$mesh.encryption='sae'
 uci set wireless.$mesh.key="$MESH_KEY"
-uci set wireless.$mesh.mesh_fwding='0'   # batman-adv does the forwarding, not 802.11s
+uci set wireless.$mesh.mesh_fwding='0'   # states intent; NOT the effective source (see below)
 uci set wireless.$mesh.beacon_int='1000'
+
+# 802.11s mesh_fwding MUST also be disabled at its REAL source, /etc/config/mesh11sd.
+# netifd-morse generates /var/run/wpa_supplicant-<meshif>.conf from
+# mesh11sd.mesh_params.*, NOT from the wifi-iface options above -- and it does so
+# even when the mesh11sd DAEMON is disabled (enabled='0'), because the file is used
+# purely as a parameter source. The shipped default mesh_fwding='1' therefore wins,
+# leaving BOTH 802.11s and batman-adv forwarding the same frames (duplicate paths,
+# wasted airtime; bridge_loop_avoidance does not cover this).
+# Verified on an RPi4/MM6108 gateway 2026-09-06: setting only
+# wireless.$mesh.mesh_fwding='0' left mesh_fwding=1 in both the generated conf and
+# the kernel (iw dev <meshif> get mesh_param mesh_fwding); setting it here flipped
+# both to 0. The same applies to mesh_rssi_threshold / mesh_beaconless_mode /
+# mesh_dynamic_peering, which also arrive from this file.
+uci set mesh11sd.mesh_params.mesh_fwding='0'
 
 # 5 GHz EUD AP (operator) — on whichever radio can do 5 GHz
 if [ -n "$EUD5G_DEV" ]; then
@@ -207,6 +221,28 @@ uci set network.batmesh0=interface
 uci set network.batmesh0.proto='batadv_hardif'
 uci set network.batmesh0.master='bat0'
 
+# Remove the factory lan/br-lan FIRST -- before br-ahwlan is located/created below.
+# NEITHER role wants it, and left in place it COMPETES for $WAN_IFACE: the stock
+# config bridges eth0 into br-lan, so once eth0 is also claimed (network.wan on a
+# gateway, or br-ahwlan's port list on a meshpoint) the same netdev has two owners.
+# netifd's resolution is undefined -- typically the bridge captures the netdev and
+# the gateway's WAN DHCP client never gets a lease -- and on a gateway it
+# additionally leaves a second overlapping /16 (br-lan 10.41.254.1 vs br-ahwlan
+# 10.41.0.1), making routing ambiguous. Deleting network.lan alone is NOT enough:
+# the `config device` section named br-lan holds the port list and must go too.
+# This is the long-standing "provisioned gateway has no uplink / is unreachable"
+# failure; observed again on an RPi4/MM6108 gateway 2026-09-06.
+#
+# ORDER MATTERS: UCI anonymous section indices are positional, so deleting a
+# @device[N] RENUMBERS every later one. Doing this before the br-ahwlan
+# find-or-create below means $brsec is resolved against the final numbering; the
+# reverse order can leave $brsec pointing at a shifted (wrong) section.
+uci -q delete network.lan || true
+uci -q delete dhcp.lan || true
+lansec=""
+for s in $(uci show network | sed -n "s/^network\.\(@device\[[0-9]*\]\)\.name='br-lan'/\1/p"); do lansec="$s"; done
+[ -n "$lansec" ] && uci -q delete "network.$lansec" || true
+
 # br-ahwlan bridge (the EUD/mesh L2; APs bridge in via network='ahwlan').
 # Find-or-create the bridge device section.
 brsec=""
@@ -235,7 +271,6 @@ else
   # forcing one is futile. WAN_IFACE becomes a wired LAN port bridged into the
   # mesh L2 (a wired EUD/laptop on it joins the mesh + gets DHCP from the gateway).
   uci -q delete network.wan || true
-  uci -q delete network.lan || true
   uci set network.$brsec.ports="bat0 $WAN_IFACE"
 fi
 
