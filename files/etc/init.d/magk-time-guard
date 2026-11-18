@@ -1,0 +1,18 @@
+#!/bin/sh /etc/rc.common
+# Stale-clock guard for the gateway time server (AD-4). STAGED, UNTESTED ON HARDWARE.
+# Runs before chronyd (START=15). Does nothing unless magk-time-server apply created the flag file,
+# so it is inert on every node that is not a time-serving gateway.
+START=14
+STOP=89
+
+FLAG=/etc/chrony/magk-time-server.enabled
+
+start() {
+	[ -e "$FLAG" ] || return 0
+	/usr/sbin/magk-time-server guard-start
+}
+
+stop() {
+	[ -e "$FLAG" ] || return 0
+	/usr/sbin/magk-time-server save-lastgood || true
+}
