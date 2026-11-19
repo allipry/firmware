@@ -1,3 +1,1 @@
-# Gateway-hosted time server (AD-4 / INF-4). chrony serves NTP; chronyc is in the same package.
-# STAGED, UNTESTED. Board scoped on purpose: the Heltec HT-HD01 V2 images do not get it.
-CONFIG_PACKAGE_chrony=y
+../common_extras/time_diffconfig

@@ -1,0 +1,7 @@
+# Gateway-hosted time server (AD-4 / INF-4). chrony serves NTP; chronyc is in the same package.
+# STAGED, UNTESTED. Shipped by default only for ekh-bcm2711 (symlink in boards/ekh-bcm2711/, which
+# scripts/openmanet_setup.sh requires for every non-target *_diffconfig). Other boards can opt in
+# with the setup script's extras option (-x time); the Heltec HT-HD01 V2 images do not get it.
+# MINIMAL=1 builds read only target_diffconfig, so they omit chrony by design: a minimal image
+# has no time server and magk-time-server apply warns and does nothing.
+CONFIG_PACKAGE_chrony=y

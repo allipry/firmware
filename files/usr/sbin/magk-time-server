@@ -1,21 +1,34 @@
 #!/bin/sh
 # magk-time-server: gateway-hosted NTP (chrony) for the MAGK objective units.
-# docs/decisions.md AD-4, task INF-4 (magk-objective package).
+# docs/decisions.md AD-4 and AD-9, task INF-4 (magk-objective package).
 # STAGED, UNTESTED ON HARDWARE. Off unless TIME_SERVER=1 in magk-node.env.
 #
 #   magk-time-server render   print the chrony.conf that apply would write
 #   magk-time-server apply    gateway: write config, firewall rules, DHCP option, enable chronyd
-#   magk-time-server remove   undo apply (also what a meshpoint runs)
+#   magk-time-server remove   undo apply (also what a meshpoint runs); restores sysntpd if apply disabled it
 #   magk-time-server status   one line of sync state read from chronyd
 #   magk-time-server guard-start      boot step: restore the last good clock, decide if the local fallback may serve
 #   magk-time-server save-lastgood    cron step: record the clock while it is synced to a real source
 #   magk-time-server seed             operator asserts the CURRENT clock is correct (gateway with no WAN, no GPS)
 #
-# Env: TIME_UPSTREAM (space separated hosts, empty = none, no public pool by default),
+# Env: TIME_UPSTREAM (space separated hosts, empty = none),
 #      TIME_GPS (1 = gpsd SHM refclock), TIME_LOCAL_STRATUM (default 10, range 2..15),
-#      TIME_ALLOW (default 10.41.0.0/16), TIME_DHCP_OPTION (1 = DHCP option 42),
+#      TIME_ALLOW (default 10.41.0.0/16, prefix /8 to /32), TIME_DHCP_OPTION (1 = DHCP option 42),
 #      NODE_MGMT_IP (default 10.41.0.1).
-# Test hook: MAGK_TIME_ROOT=<dir> writes files under <dir> and skips uci, init scripts, chronyc.
+#      MAGK_TIME_STAGE_ONLY=1 (apply/remove only stage uci changes; the caller commits and reloads).
+#
+# Stale-clock guard, in short:
+#  - a gateway whose time source is configured (TIME_UPSTREAM or TIME_GPS, "gated") serves its own clock as a
+#    fallback only after it has synced to a real source in this boot (or an operator ran seed, which does not
+#    survive a reboot). A fitted RTC never opens the gate by itself (round 2, N2): sysfixtime rewrites the RTC from
+#    /etc file times, so a reset RTC cannot be told from a good one;
+#  - a gateway with no source (operator seeded) serves its own clock when a verified lastgood exists;
+#  - lastgood is bounded (window, uptime, stratum, offset, two-sighting confirmation for big jumps).
+# Recovery from a bad lastgood: rm /etc/chrony/lastgood /etc/chrony/rtc-verified, fix the clock, run seed.
+#
+# Test hooks (dev machine only): MAGK_TIME_ROOT=<dir> roots every path under <dir> and skips real clock changes,
+#   MAGK_TIME_STUBS=1 additionally runs the uci/init-script steps against stubs, MAGK_TIME_NOW and
+#   MAGK_TIME_UPTIME fake the clock and uptime. See tests/time_server_guard_test.sh.
 set -eu
 
 ROOT="${MAGK_TIME_ROOT:-}"
@@ -30,8 +43,22 @@ GW_IP="${NODE_MGMT_IP:-10.41.0.1}"
 LASTGOOD="$ROOT/etc/chrony/lastgood"
 LOCALCONF="$ROOT/var/etc/chrony.d/20-magk-local.conf"
 ENABLED="$ROOT/etc/chrony/magk-time-server.enabled"
-FLOOR=1767225600   # 2026-01-01 00:00:00 UTC: any clock below this is junk, never trusted
-SAVE_EVERY=3600    # seconds between lastgood writes (flash wear: at most 24 per day)
+SYSNTPD_FLAG="$ROOT/etc/chrony/magk-sysntpd-disabled"
+RTCV="$ROOT/etc/chrony/rtc-verified"
+RTC_SYS="$ROOT/sys/class/rtc/rtc0/since_epoch"
+PENDING="$ROOT/tmp/magk-time-pending"
+SAVEUP="$ROOT/tmp/magk-time-saveup"   # uptime at the last lastgood write in THIS boot (tmpfs, gone at reboot)
+BUILDTS="$ROOT/etc/magk-build-ts"
+INITD="$ROOT/etc/init.d"
+CRON="$ROOT/etc/crontabs/root"
+FLOOR=1767225600     # 2026-01-01 00:00:00 UTC: any clock below this is junk, never trusted
+CEIL_DEFAULT=1893456000   # 2030-01-01 00:00:00 UTC: any clock above this is junk (TBR: stamp the build date, see below)
+SAVE_EVERY=3600      # seconds between lastgood writes (flash wear: at most 24 per day)
+MARGIN=7200          # slack, seconds, between lastgood + uptime and a new reading before it counts as a jump
+CONFIRM_MIN=300      # a big jump needs a second sighting at least this many seconds (monotonic) later
+CONFIRM_TOL=120      # and the two sightings must agree with the monotonic clock within this many seconds
+RTC_SKEW_MAX=60      # seconds: larger |system clock - RTC| is reported at boot
+OFFSET_MAX=1.0       # seconds: largest |system time offset| accepted when recording a time
 CRONLINE="*/10 * * * * /usr/sbin/magk-time-server save-lastgood"
 RULE_WAN="magk_ntp_wan_reject"
 RULE_MESH="magk_ntp_mesh_accept"
@@ -39,12 +66,33 @@ RULE_MESH="magk_ntp_mesh_accept"
 die() { echo "magk-time-server: $*" >&2; exit 1; }
 warn() { echo "magk-time-server: WARNING: $*" >&2; }
 live() { [ -z "$ROOT" ]; }
+# sysops: run the uci / init script / cron steps. Real node, or a test run with stubs.
+sysops() { [ -z "$ROOT" ] || [ -n "${MAGK_TIME_STUBS:-}" ]; }
+is_int() { case "$1" in ''|*[!0-9]*) return 1;; esac; return 0; }
+
+# Latest clock value this firmware accepts. If the image build stamps /etc/magk-build-ts (epoch seconds),
+# the ceiling is that stamp plus one year. Nothing stamps it yet (TBR owner Allison/magkops), so the
+# constant above applies and must be raised in a later release.
+ceiling() {
+  if [ -f "$BUILDTS" ]; then
+    b="$(cat "$BUILDTS" 2>/dev/null || true)"
+    if is_int "$b" && [ "$b" -ge "$FLOOR" ]; then echo $((b + 31536000)); return 0; fi
+  fi
+  echo "$CEIL_DEFAULT"
+}
 
 validate() {
   case "$TIME_LOCAL_STRATUM" in ''|*[!0-9]*) die "TIME_LOCAL_STRATUM must be an integer";; esac
   [ "$TIME_LOCAL_STRATUM" -ge 2 ] && [ "$TIME_LOCAL_STRATUM" -le 15 ] || die "TIME_LOCAL_STRATUM must be 2..15"
-  case "$TIME_ALLOW" in ''|*[!0-9./]*) die "TIME_ALLOW must be an IPv4 subnet like 10.41.0.0/16";; esac
-  case "$TIME_ALLOW" in 0.0.0.0/0|0/0) die "TIME_ALLOW must not be the whole internet";; esac
+  case "$TIME_ALLOW" in */*) ;; *) die "TIME_ALLOW must be an IPv4 subnet like 10.41.0.0/16";; esac
+  net="${TIME_ALLOW%/*}"; plen="${TIME_ALLOW#*/}"
+  is_int "$plen" && [ "$plen" -ge 8 ] && [ "$plen" -le 32 ] || die "TIME_ALLOW prefix must be /8 to /32 (same floor as the Configurator)"
+  case "$net" in ''|*[!0-9.]*) die "TIME_ALLOW must be an IPv4 subnet like 10.41.0.0/16";; esac
+  oldifs="$IFS"; IFS=.; set -- $net; IFS="$oldifs"
+  [ "$#" -eq 4 ] || die "TIME_ALLOW must be an IPv4 subnet like 10.41.0.0/16"
+  for o in "$@"; do
+    is_int "$o" && [ "$o" -le 255 ] || die "TIME_ALLOW must be an IPv4 subnet like 10.41.0.0/16"
+  done
   case "$GW_IP" in ''|*[!0-9.]*) die "NODE_MGMT_IP must be an IPv4 address";; esac
   for h in $TIME_UPSTREAM; do
     case "$h" in *[!A-Za-z0-9.:_-]*) die "bad upstream host name: $h";; esac
@@ -65,8 +113,8 @@ render() {
     echo "# gpsd SHM 0 = NMEA time. USB GNSS has no PPS: expect 0.1 to 0.5 s offset (BENCH, UNVERIFIED)."
     echo "refclock SHM 0 refid GPS precision 1e-1 delay 0.2"
   fi
-  echo "# The 'local stratum $TIME_LOCAL_STRATUM' fallback is NOT here. guard-start writes it to"
-  echo "# /var/etc/chrony.d/20-magk-local.conf only when the gateway clock is trusted (stale-clock guard)."
+  echo "# The 'local stratum $TIME_LOCAL_STRATUM' fallback is NOT here. magk-time-server writes it to"
+  echo "# /var/etc/chrony.d/20-magk-local.conf only when the stale-clock guard allows it."
   echo "# One subnet only. No UCI allow section exists, so the OpenWrt WAN 0/0 default cannot apply."
   echo "allow $TIME_ALLOW"
   echo "# Per client: about 1 reply per 8 s average, burst 8. timesyncd polls no faster than 32 s."
@@ -79,43 +127,100 @@ render() {
   echo "driftfile /etc/chrony/chrony.drift"
 }
 
+# Firewall rules are NAMED sections (firewall.<name>), so lookups and deletes never depend on an index.
 fw_rule() { # name src target
-  sec=""
-  for z in $(uci show firewall | sed -n "s/^firewall\.\([^.]*\)\.name='$1'/\1/p"); do sec="$z"; done
-  [ -n "$sec" ] || { sec="$(uci add firewall rule)"; uci set "firewall.$sec.name=$1"; }
-  uci set "firewall.$sec.src=$2"
-  uci set "firewall.$sec.proto=udp"
-  uci set "firewall.$sec.dest_port=123"
-  uci set "firewall.$sec.target=$3"
+  fw_rule_del_legacy "$1"
+  uci set "firewall.$1=rule"
+  uci set "firewall.$1.name=$1"
+  uci set "firewall.$1.src=$2"
+  uci set "firewall.$1.proto=udp"
+  uci set "firewall.$1.dest_port=123"
+  uci set "firewall.$1.target=$3"
+}
+# anonymous sections with this name (written by an earlier build), highest index first so indexes do not shift
+fw_rule_del_legacy() {
+  ids="$(uci -q show firewall | sed -n "s/^firewall\.\(@rule\[[0-9]*\]\)\.name='$1'\$/\1/p" || true)"
+  [ -n "$ids" ] || return 0
+  for z in $(printf '%s\n' "$ids" | sed '1!G;h;$!d'); do uci -q delete "firewall.$z" || true; done
 }
 fw_rule_del() {
-  for z in $(uci show firewall | sed -n "s/^firewall\.\([^.]*\)\.name='$1'/\1/p"); do uci -q delete "firewall.$z" || true; done
+  fw_rule_del_legacy "$1"
+  uci -q delete "firewall.$1" || true
 }
+# the caller (magk-provision-node) commits and reloads once when MAGK_TIME_STAGE_ONLY=1
+stage_only() { [ "${MAGK_TIME_STAGE_ONLY:-0}" = "1" ]; }
+ucommit() { stage_only || uci commit "$@"; }
 
 now_s() { echo "${MAGK_TIME_NOW:-$(date +%s)}"; }
-is_int() { case "$1" in ''|*[!0-9]*) return 1;; esac; return 0; }
-read_lastgood() { # prints the value, or nothing when absent or damaged
+uptime_s() { echo "${MAGK_TIME_UPTIME:-$(cut -d. -f1 /proc/uptime)}"; }
+read_lastgood() { # prints the value, or nothing when absent, damaged, or outside the plausible window
   [ -f "$LASTGOOD" ] || return 0
   v="$(cat "$LASTGOOD" 2>/dev/null || true)"
-  is_int "$v" && [ "$v" -ge "$FLOOR" ] && echo "$v"
+  c="$(ceiling)"
+  if is_int "$v" && [ "$v" -ge "$FLOOR" ] && [ "$v" -le "$c" ]; then echo "$v"; fi
+  return 0
+}
+is_gated() { [ -f "$ENABLED" ] && grep -q '^gated=1' "$ENABLED"; }
+
+# ---- RTC (D9). Inert unless the kernel exposes rtc0. UNVERIFIED on hardware: bench R1 to R9 in the runbook.
+rtc_present() { [ -r "$RTC_SYS" ]; }
+rtc_read() { # RTC time as epoch seconds, from sysfs (no date parsing)
+  v="$(cat "$RTC_SYS" 2>/dev/null || true)"
+  if is_int "$v"; then echo "$v"; fi
+  return 0
+}
+# Write the RTC from the (verified) system clock. The marker holds the time written, and exists only
+# after a successful hwclock -w, so an RTC set by sysfixtime from file times never counts as verified.
+rtc_write() { # epoch the system clock is verified at
+  rtc_present || return 0
+  command -v hwclock >/dev/null 2>&1 || { warn "hwclock not found: RTC not written"; return 0; }
+  if hwclock -w -u -f "$ROOT/dev/rtc0"; then
+    echo "$1" > "$RTCV.new" && mv "$RTCV.new" "$RTCV"
+  else
+    warn "hwclock -w failed: RTC not marked verified"
+  fi
+  return 0
+}
+# The RTC is only a clock source for the kernel at boot (sysfixtime, not this script). It never opens the fallback
+# gate (N2). guard_start only reports when the system clock and the RTC disagree (N1).
+rtc_skew_warn() { # system clock epoch
+  rtc_present || return 0
+  r="$(rtc_read)"; [ -n "$r" ] || return 0
+  d=$(( $1 - r )); [ "$d" -ge 0 ] || d=$(( -d ))
+  [ "$d" -le "$RTC_SKEW_MAX" ] || warn "system clock $1 differs from the RTC $r by $d s: the RTC was not loaded at boot, or is wrong. The RTC is not used to open the fallback."
   return 0
 }
 
+write_local_open() { echo "local stratum $TIME_LOCAL_STRATUM" > "$LOCALCONF"; }
+local_is_open() { [ -f "$LOCALCONF" ] && grep -q '^local ' "$LOCALCONF"; }
+
 # Boot step, runs before chronyd (init order 14 < 15).
 # 1. If the clock is behind the last good time, set it to the last good time (like fake-hwclock).
-# 2. Allow the local-clock fallback only when a good time was ever recorded and the clock is above the floor.
-#    Without that, chronyd answers as unsynchronised (stratum 16) and units ignore it.
+# 2. Decide whether the local-clock fallback may serve. The RTC is NOT an input (N2). Without it chronyd answers as unsynchronised (stratum 16)
+#    and units ignore it.
+#      clock outside FLOOR..ceiling         withheld
+#      gated (upstream or GPS configured)   withheld until the first real sync (save-lastgood opens it)
+#      not gated, lastgood on record        allowed
+#      otherwise                            withheld (run: magk-time-server seed)
 guard_start() {
   validate
-  lg="$(read_lastgood)"; now="$(now_s)"
+  lg="$(read_lastgood)"; now="$(now_s)"; c="$(ceiling)"
   if [ -n "$lg" ] && [ "$now" -lt "$lg" ]; then
     echo "magk-time-server: clock $now is behind last good time $lg: restoring"
     live && date -s "@$lg" >/dev/null
     now="$lg"
   fi
   mkdir -p "$(dirname "$LOCALCONF")"
-  if [ -n "$lg" ] && [ "$now" -ge "$FLOOR" ]; then
-    echo "local stratum $TIME_LOCAL_STRATUM" > "$LOCALCONF"
+  rm -f "$SAVEUP"   # a new boot: the uptime reference of an earlier boot means nothing
+  rtc_skew_warn "$now"
+  if [ "$now" -lt "$FLOOR" ] || [ "$now" -gt "$c" ]; then
+    echo "# local fallback withheld: clock $now is outside $FLOOR..$c" > "$LOCALCONF"
+    warn "local fallback WITHHELD: clock $now is outside the plausible window $FLOOR..$c."
+  elif is_gated; then
+    echo "# local fallback withheld until the first sync to a real source (stale-clock guard)" > "$LOCALCONF"
+    echo "magk-time-server: local fallback withheld until chronyd syncs to a real source"
+  elif [ -n "$lg" ]; then
+    write_local_open
     echo "magk-time-server: local fallback ALLOWED (last good time $lg)"
   else
     echo "# local fallback withheld: this gateway has never recorded a verified time (run: magk-time-server seed)" > "$LOCALCONF"
@@ -123,31 +228,83 @@ guard_start() {
   fi
 }
 
-# Cron step. Records the clock only while chronyd is synced to a real source (not the local fallback),
-# never moves the record backwards, and writes at most once per SAVE_EVERY seconds.
+# A jump beyond lastgood + uptime + MARGIN (first record, or after an outage) is accepted only on a second
+# sighting at least CONFIRM_MIN seconds later whose wall-clock delta agrees with the monotonic delta.
+# This stops a one-off bad reading. It cannot stop a source that stays wrong for the whole window.
+confirm_jump() { # now uptime
+  mkdir -p "$(dirname "$PENDING")"
+  if [ -f "$PENDING" ]; then
+    read -r pn pu < "$PENDING" || true
+    if is_int "${pn:-}" && is_int "${pu:-}"; then
+      dn=$(( $1 - pn )); du=$(( $2 - pu ))
+      d=$(( dn - du )); [ "$d" -ge 0 ] || d=$(( -d ))
+      if [ "$du" -ge "$CONFIRM_MIN" ] && [ "$d" -le "$CONFIRM_TOL" ]; then rm -f "$PENDING"; return 0; fi
+    fi
+  fi
+  echo "$1 $2" > "$PENDING"
+  return 1
+}
+
+# Cron step (every 10 minutes). Records the clock only while chronyd is synced to a real source (not the local
+# fallback) with stratum below 16 and a small offset, inside the plausible window, never backwards, at most once
+# per SAVE_EVERY seconds. First real sync on a gated gateway opens the local fallback (M1, m5).
 save_lastgood() {
   st="$(status 2>/dev/null || true)"
   case "$st" in state=synced*) ;; *) return 0;; esac
-  now="$(now_s)"; lg="$(read_lastgood)"
-  is_int "$now" && [ "$now" -ge "$FLOOR" ] || return 0
+  strat="$(echo "$st" | sed -n 's/.*stratum=\([0-9]*\).*/\1/p')"
+  off="$(echo "$st" | sed -n 's/.*offset=\([0-9.]*\).*/\1/p')"
+  is_int "$strat" && [ "$strat" -lt 16 ] || return 0
+  [ -n "$off" ] && awk -v o="$off" -v m="$OFFSET_MAX" 'BEGIN { exit !(o + 0 < m + 0) }' || return 0
+  now="$(now_s)"; up="$(uptime_s)"; c="$(ceiling)"; lg="$(read_lastgood)"
+  is_int "$now" && [ "$now" -ge "$FLOOR" ] && [ "$now" -le "$c" ] || return 0
+  is_int "$up" || return 0
+  if is_gated && ! local_is_open; then
+    mkdir -p "$(dirname "$LOCALCONF")"
+    write_local_open
+    echo "magk-time-server: first real sync: local fallback ALLOWED"
+    if sysops && [ -x "$INITD/chronyd" ]; then "$INITD/chronyd" restart || true; fi
+  fi
+  big=0; write_lg=1
   if [ -n "$lg" ]; then
     [ "$now" -gt "$lg" ] || return 0
-    [ $((now - lg)) -ge "$SAVE_EVERY" ] || return 0
+    [ $((now - lg)) -ge "$SAVE_EVERY" ] || write_lg=0
+    # forward bound: time since the last write in this boot (uptime delta), else uptime since boot (N3)
+    sup=""; [ ! -f "$SAVEUP" ] || read -r sup < "$SAVEUP" || true
+    if is_int "${sup:-}" && [ "$sup" -le "$up" ]; then bound=$((lg + (up - sup) + MARGIN)); else bound=$((lg + up + MARGIN)); fi
+    [ "$now" -le "$bound" ] || big=1
+  else
+    big=1
   fi
-  mkdir -p "$(dirname "$LASTGOOD")"
-  echo "$now" > "$LASTGOOD.new" && mv "$LASTGOOD.new" "$LASTGOOD"
+  rtc_needs=0
+  if rtc_present && [ ! -f "$RTCV" ]; then rtc_needs=1; fi
+  [ "$write_lg" = 1 ] || [ "$rtc_needs" = 1 ] || return 0
+  if [ "$big" = 1 ]; then confirm_jump "$now" "$up" || return 0; fi
+  if [ "$write_lg" = 1 ]; then
+    mkdir -p "$(dirname "$LASTGOOD")"
+    echo "$now" > "$LASTGOOD.new" && mv "$LASTGOOD.new" "$LASTGOOD"
+    echo "$up" > "$SAVEUP"
+  fi
+  if [ "$write_lg" = 1 ] || [ "$rtc_needs" = 1 ]; then rtc_write "$now"; fi
 }
 
 # Operator step for a gateway that has no WAN and no GPS: the operator checks the clock against a
 # trusted reference (phone, GNSS app) and then runs this. It is an assertion, so it is loud.
 seed() {
-  now="$(now_s)"
+  now="$(now_s)"; c="$(ceiling)"
   is_int "$now" && [ "$now" -ge "$FLOOR" ] || die "clock reads $now, below the floor $FLOOR: set it first with 'date -s'"
+  [ "$now" -le "$c" ] || die "clock reads $now, above the ceiling $c: set it first with 'date -s'"
   mkdir -p "$(dirname "$LASTGOOD")"
   echo "$now" > "$LASTGOOD.new" && mv "$LASTGOOD.new" "$LASTGOOD"
+  rtc_write "$now"
   echo "magk-time-server: recorded $now ($(date -u -d "@$now" 2>/dev/null || date -u -r "$now")) as a verified time"
   guard_start
-  live && [ -x /etc/init.d/chronyd ] && /etc/init.d/chronyd restart || true
+  mkdir -p "$(dirname "$SAVEUP")"; uptime_s > "$SAVEUP"   # after guard_start, which clears it at boot
+  # the operator has just vouched for this clock: open the fallback even on a gated gateway (no WAN, no GPS yet)
+  write_local_open
+  if sysops && [ -x "$INITD/chronyd" ]; then "$INITD/chronyd" restart || true; fi
+  if is_gated; then
+    warn "this gateway has a time source configured (upstream or GPS). The seed opens the fallback for THIS boot only: after a reboot it stays withheld until the first real sync (N6)."
+  fi
 }
 
 apply() {
@@ -156,68 +313,91 @@ apply() {
     warn "chronyd is not in this image (package chrony). Nothing applied."; return 0
   fi
   [ -n "$TIME_UPSTREAM" ] || [ "$TIME_GPS" = "1" ] || \
-    warn "no TIME_UPSTREAM and no TIME_GPS: units would follow the gateway's own, possibly stale, clock"
+    warn "no TIME_UPSTREAM and no TIME_GPS: units would follow the gateway's own clock (seed it, see 'magk-time-server seed')"
   mkdir -p "$ROOT/etc/chrony" "$ROOT/etc/config"
   render > "$CONF.new" && mv "$CONF.new" "$CONF"
   printf '# Intentionally empty. magk-time-server owns /etc/chrony/chrony.conf.\n' > "$UCICONF"
-  touch "$ENABLED"
+  if [ -n "$TIME_UPSTREAM" ] || [ "$TIME_GPS" = "1" ]; then
+    printf 'gated=1\n' > "$ENABLED"
+  else
+    printf 'gated=0\n' > "$ENABLED"
+  fi
   guard_start
-  live || return 0
-  if [ -x /etc/init.d/magk-time-guard ]; then /etc/init.d/magk-time-guard enable; fi
-  mkdir -p /etc/crontabs; touch /etc/crontabs/root
-  grep -qF "$CRONLINE" /etc/crontabs/root || echo "$CRONLINE" >> /etc/crontabs/root
-  /etc/init.d/cron restart 2>/dev/null || true
-  # the OpenWrt default NTP client would fight chronyd for the clock
-  if [ -x /etc/init.d/sysntpd ]; then
+  sysops || return 0
+  if [ -x "$INITD/magk-time-guard" ]; then "$INITD/magk-time-guard" enable; fi
+  mkdir -p "$ROOT/etc/crontabs"; touch "$CRON"
+  grep -qF "$CRONLINE" "$CRON" || echo "$CRONLINE" >> "$CRON"
+  "$INITD/cron" restart 2>/dev/null || true
+  # the OpenWrt default NTP client would fight chronyd for the clock; remember we disabled it (m1)
+  if [ -x "$INITD/sysntpd" ]; then
+    if "$INITD/sysntpd" enabled 2>/dev/null; then : > "$SYSNTPD_FLAG"; fi
     uci -q set system.ntp.enabled='0' || true
-    /etc/init.d/sysntpd stop 2>/dev/null || true
-    /etc/init.d/sysntpd disable 2>/dev/null || true
+    "$INITD/sysntpd" stop 2>/dev/null || true
+    "$INITD/sysntpd" disable 2>/dev/null || true
   fi
   fw_rule "$RULE_MESH" ahwlan ACCEPT
   fw_rule "$RULE_WAN" wan REJECT
   uci -q del_list "dhcp.ahwlan.dhcp_option=42,$GW_IP" || true
-  [ "$TIME_DHCP_OPTION" = "1" ] && uci add_list "dhcp.ahwlan.dhcp_option=42,$GW_IP"
-  uci commit system firewall dhcp
-  /etc/init.d/chronyd enable
+  if [ "$TIME_DHCP_OPTION" = "1" ]; then uci add_list "dhcp.ahwlan.dhcp_option=42,$GW_IP"; fi
+  ucommit system firewall dhcp
+  "$INITD/chronyd" enable
   if [ "${MAGK_NO_RELOAD:-0}" != "1" ]; then
-    /etc/init.d/chronyd restart
-    /etc/init.d/firewall reload 2>/dev/null || true
-    /etc/init.d/dnsmasq reload 2>/dev/null || true
+    "$INITD/chronyd" restart
+    if ! stage_only; then
+      "$INITD/firewall" reload 2>/dev/null || true
+      "$INITD/dnsmasq" reload 2>/dev/null || true
+    fi
   fi
   echo "magk-time-server: applied (serving $TIME_ALLOW from $GW_IP, local stratum $TIME_LOCAL_STRATUM)"
 }
 
 remove() {
   rm -f "$ENABLED"
-  live || return 0
-  if [ -f /etc/crontabs/root ]; then
-    grep -vF "$CRONLINE" /etc/crontabs/root > /tmp/magk-cron.new || true
-    cat /tmp/magk-cron.new > /etc/crontabs/root; rm -f /tmp/magk-cron.new
+  sysops || return 0
+  if [ -f "$CRON" ]; then
+    grep -vF "$CRONLINE" "$CRON" > "$CRON.new" || true
+    mv "$CRON.new" "$CRON"
   fi
   rm -f "$LOCALCONF"
-  [ -x /etc/init.d/magk-time-guard ] && /etc/init.d/magk-time-guard disable 2>/dev/null || true
+  if [ -x "$INITD/magk-time-guard" ]; then "$INITD/magk-time-guard" disable 2>/dev/null || true; fi
   fw_rule_del "$RULE_MESH"; fw_rule_del "$RULE_WAN"
   uci -q del_list "dhcp.ahwlan.dhcp_option=42,$GW_IP" || true
-  uci commit firewall dhcp
-  if [ -x /etc/init.d/chronyd ]; then
-    /etc/init.d/chronyd stop 2>/dev/null || true
-    /etc/init.d/chronyd disable 2>/dev/null || true
+  if [ -x "$INITD/chronyd" ]; then
+    "$INITD/chronyd" stop 2>/dev/null || true
+    "$INITD/chronyd" disable 2>/dev/null || true
   fi
-  # sysntpd (the OpenWrt default client) is left as the image shipped it unless apply disabled it:
-  # re-enable it by hand if rolling back a gateway (see the report).
+  # give the NTP client back only if apply was the one that turned it off (m1)
+  if [ -f "$SYSNTPD_FLAG" ]; then
+    uci -q set system.ntp.enabled='1' || true
+    if [ -x "$INITD/sysntpd" ]; then
+      "$INITD/sysntpd" enable 2>/dev/null || true
+      "$INITD/sysntpd" start 2>/dev/null || true
+    fi
+    rm -f "$SYSNTPD_FLAG"
+  fi
+  ucommit system firewall dhcp
   echo "magk-time-server: removed"
 }
 
 status() {
   command -v chronyc >/dev/null 2>&1 || { echo "state=no-chronyc"; return 1; }
   t="$(chronyc -c tracking 2>/dev/null)" || { echo "state=chronyd-down"; return 1; }
-  # CSV order (chrony docs, UNVERIFIED on the built version): refid, name, stratum, ... , leap status last
-  echo "$t" | awk -F, -v ls="$TIME_LOCAL_STRATUM" '{
-    leap=$NF; st=$3; ref=$1;
+  # CSV order (chrony docs, UNVERIFIED on the built version): 1 refid, 2 name, 3 stratum, 4 ref time,
+  # 5 system time offset, ..., last field leap status. offset is printed as an absolute value in seconds.
+  out="$(echo "$t" | awk -F, '{
+    leap=$NF; st=$3; ref=$1; o=$5;
+    if (o ~ /^-?[0-9]+(\.[0-9]+)?([eE][-+]?[0-9]+)?$/) { if (o < 0) o = -o; off = sprintf("%.6f", o) } else off = "unknown";
     if (leap ~ /Not synchronised/) s="unsynchronised";
     else if (ref == "7F7F0101") s="local-only";
     else s="synced";
-    printf "state=%s stratum=%s refid=%s leap=%s\n", s, st, ref, leap }'
+    printf "state=%s stratum=%s refid=%s offset=%s leap=%s\n", s, st, ref, off, leap }')"
+  echo "$out"
+  # N6 (stderr only, so the one-line stdout format the cron step parses is unchanged)
+  case "$out" in
+    state=synced*) ;;
+    *) if is_gated && local_is_open; then warn "gated gateway is serving the local fallback without a current real sync; after a reboot it stays withheld until the first real sync."; fi;;
+  esac
+  return 0
 }
 
 case "${1:-}" in

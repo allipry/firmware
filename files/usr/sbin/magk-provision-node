@@ -324,14 +324,16 @@ fi
 # TIME SERVER — gateway-hosted NTP for the objective units (AD-4). OFF by default.
 # Gateway + TIME_SERVER=1: chrony serves the mesh subnet. Anything else: make sure it is off.
 # Details and rollback: magk-time-server, docs in the magk-objective package.
+# MAGK_TIME_STAGE_ONLY=1: magk-time-server only stages uci changes; the single commit and reload
+# below applies them, so a later failure cannot leave a half-committed firewall.
 # =============================================================================
 if [ -x /usr/sbin/magk-time-server ]; then
   if [ "$NODE_ROLE" = "gateway" ] && [ "${TIME_SERVER:-0}" = "1" ]; then
-    NODE_MGMT_IP="$NODE_MGMT_IP" TIME_UPSTREAM="${TIME_UPSTREAM:-}" TIME_GPS="${TIME_GPS:-0}" \
+    MAGK_TIME_STAGE_ONLY=1 NODE_MGMT_IP="$NODE_MGMT_IP" TIME_UPSTREAM="${TIME_UPSTREAM:-}" TIME_GPS="${TIME_GPS:-0}" \
       TIME_LOCAL_STRATUM="${TIME_LOCAL_STRATUM:-10}" TIME_ALLOW="${TIME_ALLOW:-10.41.0.0/16}" \
       TIME_DHCP_OPTION="${TIME_DHCP_OPTION:-0}" /usr/sbin/magk-time-server apply
   else
-    /usr/sbin/magk-time-server remove || true
+    MAGK_TIME_STAGE_ONLY=1 /usr/sbin/magk-time-server remove || true
   fi
 fi
 
